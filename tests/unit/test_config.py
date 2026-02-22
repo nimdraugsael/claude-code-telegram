@@ -592,3 +592,76 @@ def test_configuration_error_handling():
                 "APPROVED_DIRECTORY",
             ]:
                 os.environ.pop(key, None)
+
+
+# --- Voice / OpenAI configuration tests ---
+
+
+class TestVoiceConfig:
+    """Settings and feature flags for voice message transcription."""
+
+    def test_openai_api_key_defaults_to_none(self, monkeypatch):
+        """openai_api_key is optional and defaults to None."""
+        # Clear env so .env file doesn't leak a real key into the test
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        config = create_test_config(openai_api_key=None)
+        assert config.openai_api_key is None
+        assert config.openai_api_key_str is None
+
+    def test_openai_api_key_stored_as_secret(self):
+        """openai_api_key round-trips through SecretStr."""
+        config = create_test_config(openai_api_key="sk-test-key-123")
+        assert config.openai_api_key is not None
+        # SecretStr should not leak the value in repr
+        assert "sk-test-key-123" not in repr(config.openai_api_key)
+        # But the property returns the raw string
+        assert config.openai_api_key_str == "sk-test-key-123"
+
+    def test_enable_voice_messages_defaults_to_true(self):
+        """Voice messages are enabled by default."""
+        config = create_test_config()
+        assert config.enable_voice_messages is True
+
+    def test_enable_voice_messages_can_be_disabled(self):
+        """Voice messages can be explicitly disabled."""
+        config = create_test_config(enable_voice_messages=False)
+        assert config.enable_voice_messages is False
+
+    def test_feature_flag_voice_enabled_with_key(self):
+        """voice_messages_enabled is True only when both flag and key are set."""
+        config = create_test_config(
+            enable_voice_messages=True,
+            openai_api_key="sk-test",
+        )
+        flags = FeatureFlags(config)
+        assert flags.voice_messages_enabled is True
+        assert "voice_messages" in flags.get_enabled_features()
+
+    def test_feature_flag_voice_disabled_without_key(self, monkeypatch):
+        """voice_messages_enabled is False when no OpenAI key is set."""
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        config = create_test_config(enable_voice_messages=True, openai_api_key=None)
+        flags = FeatureFlags(config)
+        assert flags.voice_messages_enabled is False
+        assert "voice_messages" not in flags.get_enabled_features()
+
+    def test_feature_flag_voice_disabled_when_setting_off(self):
+        """voice_messages_enabled is False when the setting is disabled."""
+        config = create_test_config(
+            enable_voice_messages=False,
+            openai_api_key="sk-test",
+        )
+        flags = FeatureFlags(config)
+        assert flags.voice_messages_enabled is False
+        assert "voice_messages" not in flags.get_enabled_features()
+
+    def test_feature_flag_generic_check(self, monkeypatch):
+        """is_feature_enabled('voice_messages') works correctly."""
+        config = create_test_config(openai_api_key="sk-test")
+        flags = FeatureFlags(config)
+        assert flags.is_feature_enabled("voice_messages") is True
+
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        config_no_key = create_test_config(openai_api_key=None)
+        flags_no_key = FeatureFlags(config_no_key)
+        assert flags_no_key.is_feature_enabled("voice_messages") is False

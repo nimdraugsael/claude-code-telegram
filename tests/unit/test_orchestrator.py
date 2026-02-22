@@ -774,3 +774,289 @@ async def test_private_mode_rejects_help_outside_topics(private_thread_settings,
 
     assert called["value"] is False
     update.effective_message.reply_text.assert_called_once()
+
+
+# --- agentic_voice handler tests ---
+
+
+class TestAgenticVoice:
+    """Verify the voice message → Whisper → Claude pipeline in the orchestrator."""
+
+    @staticmethod
+    def _make_voice_update(
+        user_id: int = 123,
+        duration: int = 5,
+        file_size: int = 1024,
+    ) -> MagicMock:
+        """Build a mock Update carrying a voice message."""
+        update = MagicMock()
+        update.effective_user.id = user_id
+        update.message.voice.duration = duration
+        update.message.voice.file_size = file_size
+        update.message.message_id = 42
+        update.message.reply_text = AsyncMock()
+        update.message.chat.send_action = AsyncMock()
+        return update
+
+    @staticmethod
+    def _make_context(
+        deps: dict,
+        settings: object,
+        *,
+        voice_handler: object = None,
+    ) -> MagicMock:
+        features = MagicMock()
+        features.get_voice_handler.return_value = voice_handler
+
+        context = MagicMock()
+        context.user_data = {}
+        context.bot_data = {
+            "settings": settings,
+            "features": features,
+            "claude_integration": deps.get("claude_integration"),
+            # Set to None by default to avoid await issues with MagicMock;
+            # individual tests can override with AsyncMock when needed.
+            "storage": None,
+            "rate_limiter": None,
+            "audit_logger": None,
+        }
+        return context
+
+    async def test_no_voice_handler_replies_unavailable(self, agentic_settings, deps):
+        """When VoiceHandler is not configured, user is told to set OPENAI_API_KEY."""
+        orchestrator = MessageOrchestrator(agentic_settings, deps)
+        update = self._make_voice_update()
+        context = self._make_context(deps, agentic_settings, voice_handler=None)
+
+        await orchestrator.agentic_voice(update, context)
+
+        update.message.reply_text.assert_called_once()
+        msg = update.message.reply_text.call_args.args[0]
+        assert "not available" in msg.lower()
+        assert "OPENAI_API_KEY" in msg
+
+    async def test_no_features_replies_unavailable(self, agentic_settings, deps):
+        """When features is None entirely, voice is unavailable."""
+        orchestrator = MessageOrchestrator(agentic_settings, deps)
+        update = self._make_voice_update()
+
+        context = MagicMock()
+        context.user_data = {}
+        context.bot_data = {"features": None}
+
+        await orchestrator.agentic_voice(update, context)
+
+        msg = update.message.reply_text.call_args.args[0]
+        assert "not available" in msg.lower()
+
+    async def test_successful_transcription_calls_claude(self, agentic_settings, deps):
+        """Happy path: transcription shown to user, then text sent to Claude."""
+        from src.bot.features.voice_handler import TranscribedVoice
+
+        orchestrator = MessageOrchestrator(agentic_settings, deps)
+        update = self._make_voice_update()
+
+        voice_handler = AsyncMock()
+        voice_handler.process_voice = AsyncMock(
+            return_value=TranscribedVoice(
+                text="Please review my code",
+                duration_seconds=5,
+                file_size=1024,
+                metadata={"mime_type": "audio/ogg"},
+            )
+        )
+
+        # Mock Claude response
+        mock_response = MagicMock()
+        mock_response.session_id = "session-voice"
+        mock_response.content = "Sure, I'll review it!"
+        mock_response.tools_used = []
+
+        claude_integration = AsyncMock()
+        claude_integration.run_command = AsyncMock(return_value=mock_response)
+
+        context = self._make_context(
+            {**deps, "claude_integration": claude_integration},
+            agentic_settings,
+            voice_handler=voice_handler,
+        )
+
+        # Progress message mock for _process_text_with_claude
+        progress_msg = AsyncMock()
+        progress_msg.delete = AsyncMock()
+        # reply_text returns progress_msg on second call (first is transcription reply)
+        update.message.reply_text.side_effect = [
+            None,  # transcription reply
+            progress_msg,  # "Working..." progress
+            None,  # final response
+        ]
+        update.message.reply_text.return_value = progress_msg
+
+        await orchestrator.agentic_voice(update, context)
+
+        # Transcription was shown to user
+        reply_calls = update.message.reply_text.call_args_list
+        transcription_shown = any(
+            "Please review my code" in str(call) for call in reply_calls
+        )
+        assert transcription_shown
+
+        # Claude was called with the transcribed text
+        claude_integration.run_command.assert_called_once()
+        call_kwargs = claude_integration.run_command.call_args.kwargs
+        assert call_kwargs["prompt"] == "Please review my code"
+
+    async def test_value_error_shows_size_message(self, agentic_settings, deps):
+        """ValueError from process_voice (file too large) is shown to user."""
+        orchestrator = MessageOrchestrator(agentic_settings, deps)
+        update = self._make_voice_update()
+
+        voice_handler = AsyncMock()
+        voice_handler.process_voice = AsyncMock(
+            side_effect=ValueError(
+                "Voice message too large (30.0MB). Whisper limit is 25MB."
+            )
+        )
+
+        context = self._make_context(
+            deps, agentic_settings, voice_handler=voice_handler
+        )
+
+        await orchestrator.agentic_voice(update, context)
+
+        msg = update.message.reply_text.call_args.args[0]
+        assert "too large" in msg.lower()
+        assert "25MB" in msg
+
+    async def test_generic_error_shows_retry_message(self, agentic_settings, deps):
+        """Non-ValueError exceptions show a generic failure message."""
+        orchestrator = MessageOrchestrator(agentic_settings, deps)
+        update = self._make_voice_update()
+
+        voice_handler = AsyncMock()
+        voice_handler.process_voice = AsyncMock(
+            side_effect=Exception("Whisper API 500")
+        )
+
+        context = self._make_context(
+            deps, agentic_settings, voice_handler=voice_handler
+        )
+
+        await orchestrator.agentic_voice(update, context)
+
+        msg = update.message.reply_text.call_args.args[0]
+        assert "failed to transcribe" in msg.lower()
+
+    async def test_empty_transcription_prompts_typing(self, agentic_settings, deps):
+        """Empty transcription text tells user to type instead."""
+        from src.bot.features.voice_handler import TranscribedVoice
+
+        orchestrator = MessageOrchestrator(agentic_settings, deps)
+        update = self._make_voice_update()
+
+        voice_handler = AsyncMock()
+        voice_handler.process_voice = AsyncMock(
+            return_value=TranscribedVoice(
+                text="",
+                duration_seconds=2,
+                file_size=512,
+            )
+        )
+
+        context = self._make_context(
+            deps, agentic_settings, voice_handler=voice_handler
+        )
+
+        await orchestrator.agentic_voice(update, context)
+
+        msg = update.message.reply_text.call_args.args[0]
+        assert "could not transcribe" in msg.lower()
+        assert "typing" in msg.lower()
+
+    async def test_typing_action_sent(self, agentic_settings, deps):
+        """Typing indicator is sent while transcription is in progress."""
+        from src.bot.features.voice_handler import TranscribedVoice
+
+        orchestrator = MessageOrchestrator(agentic_settings, deps)
+        update = self._make_voice_update()
+
+        voice_handler = AsyncMock()
+        voice_handler.process_voice = AsyncMock(
+            return_value=TranscribedVoice(
+                text="hello",
+                duration_seconds=3,
+                file_size=256,
+            )
+        )
+
+        # Mock Claude response for the _process_text_with_claude call
+        mock_response = MagicMock()
+        mock_response.session_id = "s1"
+        mock_response.content = "response"
+        mock_response.tools_used = []
+
+        claude_integration = AsyncMock()
+        claude_integration.run_command = AsyncMock(return_value=mock_response)
+
+        context = self._make_context(
+            {**deps, "claude_integration": claude_integration},
+            agentic_settings,
+            voice_handler=voice_handler,
+        )
+
+        progress_msg = AsyncMock()
+        progress_msg.delete = AsyncMock()
+        update.message.reply_text.return_value = progress_msg
+
+        await orchestrator.agentic_voice(update, context)
+
+        update.message.chat.send_action.assert_called_with("typing")
+
+    async def test_audit_logged_as_voice_message(self, agentic_settings, deps):
+        """Audit logger records voice messages with command='voice_message'."""
+        from src.bot.features.voice_handler import TranscribedVoice
+
+        orchestrator = MessageOrchestrator(agentic_settings, deps)
+        update = self._make_voice_update(user_id=456)
+
+        voice_handler = AsyncMock()
+        voice_handler.process_voice = AsyncMock(
+            return_value=TranscribedVoice(
+                text="audit me",
+                duration_seconds=1,
+                file_size=100,
+            )
+        )
+
+        mock_response = MagicMock()
+        mock_response.session_id = "s1"
+        mock_response.content = "ok"
+        mock_response.tools_used = []
+
+        claude_integration = AsyncMock()
+        claude_integration.run_command = AsyncMock(return_value=mock_response)
+
+        audit_logger = AsyncMock()
+        audit_logger.log_command = AsyncMock()
+
+        context = self._make_context(
+            {
+                **deps,
+                "claude_integration": claude_integration,
+            },
+            agentic_settings,
+            voice_handler=voice_handler,
+        )
+        # Override audit_logger with a proper AsyncMock
+        context.bot_data["audit_logger"] = audit_logger
+
+        progress_msg = AsyncMock()
+        progress_msg.delete = AsyncMock()
+        update.message.reply_text.return_value = progress_msg
+
+        await orchestrator.agentic_voice(update, context)
+
+        audit_logger.log_command.assert_called_once()
+        call_kwargs = audit_logger.log_command.call_args.kwargs
+        assert call_kwargs["command"] == "voice_message"
+        assert call_kwargs["user_id"] == 456
