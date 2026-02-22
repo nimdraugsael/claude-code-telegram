@@ -73,6 +73,10 @@ class Settings(BaseSettings):
         None,
         description="Anthropic API key for SDK (optional if CLI logged in)",
     )
+    openai_api_key: Optional[SecretStr] = Field(
+        None,
+        description="OpenAI API key for Whisper voice transcription",
+    )
     claude_model: str = Field(
         "claude-3-5-sonnet-20241022", description="Claude model to use"
     )
@@ -162,6 +166,9 @@ class Settings(BaseSettings):
     enable_git_integration: bool = Field(True, description="Enable git commands")
     enable_file_uploads: bool = Field(True, description="Enable file upload handling")
     enable_quick_actions: bool = Field(True, description="Enable quick action buttons")
+    enable_voice_messages: bool = Field(
+        True, description="Enable voice message transcription via Whisper"
+    )
     agentic_mode: bool = Field(
         True,
         description="Conversational agentic mode (default) vs classic command mode",
@@ -419,3 +426,8 @@ class Settings(BaseSettings):
             if self.anthropic_api_key
             else None
         )
+
+    @property
+    def openai_api_key_str(self) -> Optional[str]:
+        """Get OpenAI API key as string."""
+        return self.openai_api_key.get_secret_value() if self.openai_api_key else None

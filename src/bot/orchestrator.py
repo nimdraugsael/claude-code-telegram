@@ -321,6 +321,12 @@ class MessageOrchestrator:
             group=10,
         )
 
+        # Voice messages -> Whisper transcription -> Claude
+        app.add_handler(
+            MessageHandler(filters.VOICE, self._inject_deps(self.agentic_voice)),
+            group=10,
+        )
+
         # Only cd: callbacks (for project selection), scoped by pattern
         app.add_handler(
             CallbackQueryHandler(
@@ -687,25 +693,22 @@ class MessageOrchestrator:
 
         return _on_stream
 
-    async def agentic_text(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    async def _process_text_with_claude(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        text: str,
+        audit_command: str = "text_message",
     ) -> None:
-        """Direct Claude passthrough. Simple progress. No suggestions."""
+        """Core Claude processing shared by text and voice handlers."""
         user_id = update.effective_user.id
-        message_text = update.message.text
-
-        logger.info(
-            "Agentic text message",
-            user_id=user_id,
-            message_length=len(message_text),
-        )
 
         # Rate limit check
         rate_limiter = context.bot_data.get("rate_limiter")
         if rate_limiter:
             allowed, limit_message = await rate_limiter.check_rate_limit(user_id, 0.001)
             if not allowed:
-                await update.message.reply_text(f"⏱️ {limit_message}")
+                await update.message.reply_text(f"\u23f1\ufe0f {limit_message}")
                 return
 
         chat = update.message.chat
@@ -743,7 +746,7 @@ class MessageOrchestrator:
         success = True
         try:
             claude_response = await claude_integration.run_command(
-                prompt=message_text,
+                prompt=text,
                 working_directory=current_dir,
                 user_id=user_id,
                 session_id=session_id,
@@ -771,7 +774,7 @@ class MessageOrchestrator:
                     await storage.save_claude_interaction(
                         user_id=user_id,
                         session_id=claude_response.session_id,
-                        prompt=message_text,
+                        prompt=text,
                         response=claude_response,
                         ip_address=None,
                     )
@@ -848,10 +851,78 @@ class MessageOrchestrator:
         if audit_logger:
             await audit_logger.log_command(
                 user_id=user_id,
-                command="text_message",
-                args=[message_text[:100]],
+                command=audit_command,
+                args=[text[:100]],
                 success=success,
             )
+
+    async def agentic_text(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Direct Claude passthrough. Simple progress. No suggestions."""
+        user_id = update.effective_user.id
+        message_text = update.message.text
+
+        logger.info(
+            "Agentic text message",
+            user_id=user_id,
+            message_length=len(message_text),
+        )
+
+        await self._process_text_with_claude(update, context, message_text)
+
+    async def agentic_voice(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Transcribe voice message via Whisper, then process with Claude."""
+        user_id = update.effective_user.id
+        voice = update.message.voice
+
+        logger.info(
+            "Agentic voice message",
+            user_id=user_id,
+            duration=voice.duration,
+            file_size=voice.file_size,
+        )
+
+        features = context.bot_data.get("features")
+        voice_handler = features.get_voice_handler() if features else None
+
+        if not voice_handler:
+            await update.message.reply_text(
+                "Voice transcription is not available. "
+                "Set OPENAI_API_KEY to enable it."
+            )
+            return
+
+        await update.message.chat.send_action("typing")
+
+        try:
+            result = await voice_handler.process_voice(voice)
+        except ValueError as e:
+            await update.message.reply_text(str(e))
+            return
+        except Exception as e:
+            logger.error("Voice transcription failed", error=str(e), user_id=user_id)
+            await update.message.reply_text(
+                "Failed to transcribe voice message. Please try again."
+            )
+            return
+
+        if not result.text:
+            await update.message.reply_text(
+                "Could not transcribe any text from the voice message. "
+                "Please try typing your message instead."
+            )
+            return
+
+        # Show transcription as a reply to the voice message
+        await update.message.reply_text(f"Transcription: {result.text}")
+
+        # Process through Claude
+        await self._process_text_with_claude(
+            update, context, result.text, audit_command="voice_message"
+        )
 
     async def agentic_document(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
