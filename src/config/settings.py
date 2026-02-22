@@ -169,6 +169,10 @@ class Settings(BaseSettings):
     enable_voice_messages: bool = Field(
         True, description="Enable voice message transcription via Whisper"
     )
+    whisper_prompt: Optional[str] = Field(
+        None,
+        description="Vocabulary hints for Whisper transcription (technical terms, names)",
+    )
     agentic_mode: bool = Field(
         True,
         description="Conversational agentic mode (default) vs classic command mode",

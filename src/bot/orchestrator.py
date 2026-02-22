@@ -504,12 +504,16 @@ class MessageOrchestrator:
                 user_status = rate_limiter.get_user_status(update.effective_user.id)
                 cost_usage = user_status.get("cost_usage", {})
                 current_cost = cost_usage.get("current", 0.0)
-                cost_str = f" · Cost: ${current_cost:.2f}"
+                cost_str = f" \u00b7 Cost: ${current_cost:.2f}"
             except Exception:
                 pass
 
+        voice_cost = context.user_data.get("voice_transcription_cost", 0.0)
+        voice_str = f" \u00b7 Voice: ${voice_cost:.4f}" if voice_cost > 0 else ""
+
         await update.message.reply_text(
-            f"📂 {dir_display} · Session: {session_status}{cost_str}"
+            f"\U0001f4c2 {dir_display} \u00b7 Session: {session_status}"
+            f"{cost_str}{voice_str}"
         )
 
     def _get_verbose_level(self, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -895,29 +899,54 @@ class MessageOrchestrator:
             )
             return
 
-        await update.message.chat.send_action("typing")
+        transcribing_msg = await update.message.reply_text("Transcribing...")
 
         try:
             result = await voice_handler.process_voice(voice)
         except ValueError as e:
-            await update.message.reply_text(str(e))
+            await transcribing_msg.edit_text(str(e))
             return
         except Exception as e:
             logger.error("Voice transcription failed", error=str(e), user_id=user_id)
-            await update.message.reply_text(
+            await transcribing_msg.edit_text(
                 "Failed to transcribe voice message. Please try again."
             )
             return
 
         if not result.text:
-            await update.message.reply_text(
+            await transcribing_msg.edit_text(
                 "Could not transcribe any text from the voice message. "
                 "Please try typing your message instead."
             )
             return
 
-        # Show transcription as a reply to the voice message
-        await update.message.reply_text(f"Transcription: {result.text}")
+        # Security validation — treat transcribed text like user input
+        security_validator = context.bot_data.get("security_validator")
+        audit_logger = context.bot_data.get("audit_logger")
+        if security_validator:
+            from .middleware.security import validate_message_content
+
+            is_safe, violation_type = await validate_message_content(
+                result.text, security_validator, user_id, audit_logger
+            )
+            if not is_safe:
+                from .utils.html_format import escape_html
+
+                await transcribing_msg.edit_text(
+                    "\U0001f6e1\ufe0f <b>Voice message blocked</b>\n\n"
+                    "The transcribed content was flagged as potentially "
+                    f"dangerous.\nViolation: {escape_html(violation_type)}",
+                    parse_mode="HTML",
+                )
+                return
+
+        # Track voice transcription cost
+        voice_cost = context.user_data.get("voice_transcription_cost", 0.0)
+        voice_cost += result.cost
+        context.user_data["voice_transcription_cost"] = voice_cost
+
+        # Show transcription
+        await transcribing_msg.edit_text(f"\U0001f509 {result.text}")
 
         # Process through Claude
         await self._process_text_with_claude(
