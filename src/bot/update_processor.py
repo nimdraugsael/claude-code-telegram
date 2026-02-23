@@ -1,8 +1,9 @@
 """Selective-concurrency update processor for PTB.
 
 Regular updates (messages, commands) process sequentially -- one at a time.
-Priority callbacks (stop:*) bypass the queue and run immediately so they can
-interrupt the currently-running handler.
+Priority callbacks (stop:*, plan:*, ask:*) bypass the queue and run
+immediately so they can interrupt the currently-running handler or be
+processed without waiting for the sequential lock.
 """
 
 import asyncio
@@ -19,8 +20,8 @@ class StopAwareUpdateProcessor(BaseUpdateProcessor):
     The base class holds a semaphore (max 256) then calls our
     ``do_process_update()``.
 
-    For priority callbacks (``stop:*``): we just ``await coroutine`` -- runs
-    immediately.
+    For priority callbacks (``stop:*``, ``plan:*``, ``ask:*``): we just
+    ``await coroutine`` -- runs immediately.
     For everything else: we acquire ``_sequential_lock`` first -- only one
     runs at a time.
 
@@ -30,7 +31,7 @@ class StopAwareUpdateProcessor(BaseUpdateProcessor):
     stops -> ``run_command()`` returns -> handler finishes -> lock released.
     """
 
-    _PRIORITY_PREFIXES = ("stop:",)
+    _PRIORITY_PREFIXES = ("stop:", "plan:", "ask:")
 
     def __init__(self) -> None:
         # High limit so priority callbacks are never blocked by semaphore

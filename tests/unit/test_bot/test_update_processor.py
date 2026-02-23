@@ -40,6 +40,14 @@ class TestIsPriorityCallback:
         update = _make_update("stop:123")
         assert StopAwareUpdateProcessor._is_priority_callback(update) is True
 
+    def test_plan_callback_detected(self):
+        update = _make_update("plan:123:approve")
+        assert StopAwareUpdateProcessor._is_priority_callback(update) is True
+
+    def test_ask_callback_detected(self):
+        update = _make_update("ask:123:0:1")
+        assert StopAwareUpdateProcessor._is_priority_callback(update) is True
+
     def test_cd_callback_not_priority(self):
         update = _make_update("cd:my_project")
         assert StopAwareUpdateProcessor._is_priority_callback(update) is False

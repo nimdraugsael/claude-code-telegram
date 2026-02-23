@@ -225,7 +225,7 @@ class TestStopButtonOnProgress:
 
         # First reply_text call should be the progress message with Stop button
         first_call = update.message.reply_text.call_args_list[0]
-        assert first_call.args[0] == "Working..."
+        assert first_call.args[0].endswith("...")
         reply_markup = first_call.kwargs.get("reply_markup")
         assert reply_markup is not None
         assert isinstance(reply_markup, InlineKeyboardMarkup)

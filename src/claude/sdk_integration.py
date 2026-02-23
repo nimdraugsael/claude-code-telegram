@@ -211,7 +211,14 @@ class ClaudeSDKManager:
                     "autoAllowBashIfSandboxed": True,
                     "excludedCommands": self.config.sandbox_excluded_commands or [],
                 },
-                system_prompt=base_prompt,
+                system_prompt=(
+                    base_prompt + "\n\n"
+                    "To send a file to the user as a Telegram attachment, include a markdown "
+                    "link with the absolute path: [filename](/absolute/path/to/file) for text "
+                    "files or ![filename](/absolute/path/to/file) for images. "
+                    "The system will automatically deliver it as a file attachment. "
+                    "Use this when the user asks you to share, attach, or send a file."
+                ),
                 setting_sources=["project"],
                 stderr=_stderr_callback,
             )

@@ -11,7 +11,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import structlog
 from telegram import (
@@ -33,8 +33,15 @@ from telegram.ext import (
 from ..claude.sdk_integration import StreamUpdate
 from ..config.settings import Settings
 from ..projects import PrivateTopicsUnavailableError
+from .planning import (
+    PlanningHandler,
+    PlanningState,
+    _load_state,
+    _save_state,
+    detect_planning_tool,
+)
 from .utils.draft_streamer import DraftStreamer, generate_draft_id
-from .utils.html_format import escape_html
+from .utils.html_format import escape_html, extract_local_file_refs
 from .utils.image_extractor import (
     ImageAttachment,
     should_send_as_photo,
@@ -571,6 +578,20 @@ class MessageOrchestrator:
             )
         )
 
+        # Planning callbacks
+        app.add_handler(
+            CallbackQueryHandler(
+                self._inject_deps(self._handle_plan_callback),
+                pattern=r"^plan:",
+            )
+        )
+        app.add_handler(
+            CallbackQueryHandler(
+                self._inject_deps(self._handle_ask_callback),
+                pattern=r"^ask:",
+            )
+        )
+
         # Only cd: callbacks (for project selection), scoped by pattern
         app.add_handler(
             CallbackQueryHandler(
@@ -906,6 +927,7 @@ class MessageOrchestrator:
         mcp_images: Optional[List[ImageAttachment]] = None,
         approved_directory: Optional[Path] = None,
         draft_streamer: Optional[DraftStreamer] = None,
+        planning_state_ref: Optional[List[Optional[Dict[str, Any]]]] = None,
         interrupt_event: Optional[asyncio.Event] = None,
     ) -> Optional[Callable[[StreamUpdate], Any]]:
         """Create a stream callback for verbose progress updates.
@@ -918,13 +940,25 @@ class MessageOrchestrator:
         text are streamed to the user in real time via
         ``sendMessageDraft``.
 
+        When *planning_state_ref* and *interrupt_event* are provided the
+        callback also watches for planning tool calls (``ExitPlanMode``,
+        ``AskUserQuestion``).  When one is detected the callback stores
+        tool information in ``planning_state_ref[0]`` and fires the
+        interrupt so the SDK stops.
+
         Returns None when verbose_level is 0 **and** no MCP image
-        collection or draft streaming is requested.
+        collection, draft streaming, or planning detection is requested.
         Typing indicators are handled by a separate heartbeat task.
         """
         need_mcp_intercept = mcp_images is not None and approved_directory is not None
+        needs_planning = planning_state_ref is not None and interrupt_event is not None
 
-        if verbose_level == 0 and not need_mcp_intercept and draft_streamer is None:
+        if (
+            verbose_level == 0
+            and not need_mcp_intercept
+            and draft_streamer is None
+            and not needs_planning
+        ):
             return None
 
         last_edit_time = [0.0]  # mutable container for closure
@@ -952,8 +986,20 @@ class MessageOrchestrator:
                         if img:
                             mcp_images.append(img)
 
+            # --- Planning tool detection ---
+            if needs_planning and update_obj.tool_calls:
+                ptool = detect_planning_tool(update_obj.tool_calls)
+                if ptool is not None:
+                    # Store tool info for the caller
+                    planning_state_ref[0] = {  # type: ignore[index]
+                        "tool_name": ptool["name"],
+                        "tool_input": ptool.get("input", {}),
+                    }
+                    interrupt_event.set()  # type: ignore[union-attr]
+                    return  # skip normal logging for this event
+
             # Capture tool calls
-            if update_obj.tool_calls:
+            if update_obj.tool_calls and verbose_level >= 1:
                 for tc in update_obj.tool_calls:
                     name = tc.get("name", "unknown")
                     detail = self._summarize_tool_input(name, tc.get("input", {}))
@@ -1095,28 +1141,29 @@ class MessageOrchestrator:
 
         return caption_sent
 
-    async def agentic_text(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    async def _process_text_with_claude(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        message_text: str,
+        audit_command: str = "text_message",
     ) -> None:
-        """Direct Claude passthrough. Simple progress. No suggestions."""
+        """Core logic: send text to Claude with stop button, planning, and file sending."""
         user_id = update.effective_user.id
-        message_text = update.message.text
 
-        logger.info(
-            "Agentic text message",
-            user_id=user_id,
-            message_length=len(message_text),
-        )
+        message = update.effective_message
+        if not message:
+            return
 
         # Rate limit check
         rate_limiter = context.bot_data.get("rate_limiter")
         if rate_limiter:
             allowed, limit_message = await rate_limiter.check_rate_limit(user_id, 0.001)
             if not allowed:
-                await update.message.reply_text(f"⏱️ {limit_message}")
+                await message.reply_text(f"\u23f1\ufe0f {limit_message}")
                 return
 
-        chat = update.message.chat
+        chat = message.chat
         await chat.send_action("typing")
 
         verbose_level = self._get_verbose_level(context)
@@ -1126,7 +1173,7 @@ class MessageOrchestrator:
         stop_kb = InlineKeyboardMarkup(
             [[InlineKeyboardButton("Stop", callback_data=f"stop:{user_id}")]]
         )
-        progress_msg = await update.message.reply_text(
+        progress_msg = await message.reply_text(
             self._random_working_text(), reply_markup=stop_kb
         )
 
@@ -1160,6 +1207,7 @@ class MessageOrchestrator:
         tool_log: List[Dict[str, Any]] = []
         start_time = time.time()
         mcp_images: List[ImageAttachment] = []
+        planning_state_ref: List[Optional[Dict[str, Any]]] = [None]
 
         # Stream drafts (private chats only)
         draft_streamer: Optional[DraftStreamer] = None
@@ -1181,6 +1229,7 @@ class MessageOrchestrator:
             mcp_images=mcp_images,
             approved_directory=self.settings.approved_directory,
             draft_streamer=draft_streamer,
+            planning_state_ref=planning_state_ref,
             interrupt_event=interrupt_event,
         )
 
@@ -1188,6 +1237,8 @@ class MessageOrchestrator:
         heartbeat = self._start_typing_heartbeat(chat)
 
         success = True
+        formatted_messages: list = []  # type: ignore[type-arg]
+        local_files: List[Tuple[str, str]] = []
         try:
             claude_response = await claude_integration.run_command(
                 prompt=message_text,
@@ -1212,6 +1263,57 @@ class MessageOrchestrator:
                 claude_response, context, self.settings, user_id
             )
 
+            # --- Planning tool detected: hand off to PlanningHandler ---
+            if planning_state_ref[0] is not None:
+                heartbeat.cancel()
+                self._active_requests.pop(user_id, None)
+                try:
+                    await progress_msg.delete()
+                except Exception:
+                    pass
+
+                ptool = planning_state_ref[0]
+                tool_name = ptool["tool_name"]
+                tool_input = ptool.get("tool_input", {})
+
+                if tool_name == "ExitPlanMode":
+                    state = PlanningState(
+                        type="plan_approval",
+                        session_id=claude_response.session_id,
+                        working_directory=str(current_dir),
+                        chat_id=chat.id,
+                    )
+                    _save_state(context, state)
+                    await PlanningHandler.present_plan(
+                        update,
+                        context,
+                        state,
+                        plan_content=claude_response.content or "",
+                    )
+                elif tool_name == "AskUserQuestion":
+                    questions = tool_input.get("questions", [])
+                    state = PlanningState(
+                        type="user_question",
+                        session_id=claude_response.session_id,
+                        working_directory=str(current_dir),
+                        chat_id=chat.id,
+                        questions=questions,
+                        answers={},
+                        current_question_idx=0,
+                    )
+                    _save_state(context, state)
+                    await PlanningHandler.present_question(update, context, state)
+
+                audit_logger = context.bot_data.get("audit_logger")
+                if audit_logger:
+                    await audit_logger.log_command(
+                        user_id=user_id,
+                        command=audit_command,
+                        args=[message_text[:100]],
+                        success=True,
+                    )
+                return
+
             # Store interaction
             storage = context.bot_data.get("storage")
             if storage:
@@ -1232,10 +1334,16 @@ class MessageOrchestrator:
             formatter = ResponseFormatter(self.settings)
 
             response_content = claude_response.content
-            if claude_response.interrupted:
+            if claude_response.interrupted and planning_state_ref[0] is None:
                 response_content = (
                     response_content or ""
                 ) + "\n\n_(Interrupted by user)_"
+
+            # Extract local file references before formatting
+            if response_content:
+                response_content, local_files = extract_local_file_refs(
+                    response_content
+                )
 
             formatted_messages = formatter.format_claude_response(response_content)
 
@@ -1283,13 +1391,13 @@ class MessageOrchestrator:
 
         # Send text messages (skip if caption was already embedded in photos)
         if not caption_sent:
-            for i, message in enumerate(formatted_messages):
-                if not message.text or not message.text.strip():
+            for i, fmt_msg in enumerate(formatted_messages):
+                if not fmt_msg.text or not fmt_msg.text.strip():
                     continue
                 try:
                     await update.message.reply_text(
-                        message.text,
-                        parse_mode=message.parse_mode,
+                        fmt_msg.text,
+                        parse_mode=fmt_msg.parse_mode,
                         reply_markup=None,  # No keyboards in agentic mode
                         reply_to_message_id=(
                             update.message.message_id if i == 0 else None
@@ -1305,7 +1413,7 @@ class MessageOrchestrator:
                     )
                     try:
                         await update.message.reply_text(
-                            message.text,
+                            fmt_msg.text,
                             reply_markup=None,
                             reply_to_message_id=(
                                 update.message.message_id if i == 0 else None
@@ -1332,20 +1440,142 @@ class MessageOrchestrator:
                 except Exception as img_err:
                     logger.warning("Image send failed", error=str(img_err))
 
+        # Send extracted local files as document attachments
+        for alt, fpath in local_files:
+            p = Path(fpath)
+            if p.is_file():
+                try:
+                    await message.reply_document(document=p, caption=alt or p.name)
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to send local file", path=fpath, error=str(exc)
+                    )
+
         # Audit log
         audit_logger = context.bot_data.get("audit_logger")
         if audit_logger:
             await audit_logger.log_command(
                 user_id=user_id,
-                command="text_message",
+                command=audit_command,
                 args=[message_text[:100]],
                 success=success,
             )
+
+    async def agentic_text(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Direct Claude passthrough. Simple progress. No suggestions."""
+        # Check for pending planning interaction first
+        state = _load_state(context)
+        if state is not None:
+            handled = await PlanningHandler.handle_text_for_planning(
+                update, context, state, self._resume_after_planning
+            )
+            if handled:
+                return
+
+        user_id = update.effective_user.id
+        message_text = update.message.text
+
+        logger.info(
+            "Agentic text message",
+            user_id=user_id,
+            message_length=len(message_text),
+        )
+
+        await self._process_text_with_claude(update, context, message_text)
+
+    async def agentic_voice(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Transcribe voice message via Whisper, then process with Claude."""
+        if _load_state(context) is not None:
+            await update.message.reply_text(
+                "Please respond to the pending question first."
+            )
+            return
+
+        user_id = update.effective_user.id
+        voice = update.message.voice
+
+        logger.info(
+            "Agentic voice message",
+            user_id=user_id,
+            duration=voice.duration,
+            file_size=voice.file_size,
+        )
+
+        features = context.bot_data.get("features")
+        voice_handler = features.get_voice_handler() if features else None
+
+        if not voice_handler:
+            await update.message.reply_text(self._voice_unavailable_message())
+            return
+
+        transcribing_msg = await update.message.reply_text("Transcribing...")
+
+        try:
+            result = await voice_handler.process_voice(voice)
+        except ValueError as e:
+            await transcribing_msg.edit_text(str(e))
+            return
+        except Exception as e:
+            logger.error("Voice transcription failed", error=str(e), user_id=user_id)
+            await transcribing_msg.edit_text(
+                "Failed to transcribe voice message. Please try again."
+            )
+            return
+
+        if not result.text:
+            await transcribing_msg.edit_text(
+                "Could not transcribe any text from the voice message. "
+                "Please try typing your message instead."
+            )
+            return
+
+        # Security validation — treat transcribed text like user input
+        security_validator = context.bot_data.get("security_validator")
+        audit_logger = context.bot_data.get("audit_logger")
+        if security_validator:
+            from .middleware.security import validate_message_content
+
+            is_safe, violation_type = await validate_message_content(
+                result.text, security_validator, user_id, audit_logger
+            )
+            if not is_safe:
+                from .utils.html_format import escape_html
+
+                await transcribing_msg.edit_text(
+                    "\U0001f6e1\ufe0f <b>Voice message blocked</b>\n\n"
+                    "The transcribed content was flagged as potentially "
+                    f"dangerous.\nViolation: {escape_html(violation_type)}",
+                    parse_mode="HTML",
+                )
+                return
+
+        # Track voice transcription cost
+        voice_cost = context.user_data.get("voice_transcription_cost", 0.0)
+        voice_cost += result.cost
+        context.user_data["voice_transcription_cost"] = voice_cost
+
+        # Show transcription
+        await transcribing_msg.edit_text(f"\U0001f509 {result.text}")
+
+        # Process through Claude
+        await self._process_text_with_claude(
+            update, context, result.text, audit_command="voice_message"
+        )
 
     async def agentic_document(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         """Process file upload -> Claude, minimal chrome."""
+        if _load_state(context) is not None:
+            await update.message.reply_text(
+                "Please respond to the pending question first."
+            )
+            return
+
         user_id = update.effective_user.id
         document = update.message.document
 
@@ -1525,6 +1755,12 @@ class MessageOrchestrator:
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         """Process photo -> Claude, minimal chrome."""
+        if _load_state(context) is not None:
+            await update.message.reply_text(
+                "Please respond to the pending question first."
+            )
+            return
+
         user_id = update.effective_user.id
 
         features = context.bot_data.get("features")
@@ -1558,47 +1794,6 @@ class MessageOrchestrator:
             await progress_msg.edit_text(_format_error_message(e), parse_mode="HTML")
             logger.error(
                 "Claude photo processing failed", error=str(e), user_id=user_id
-            )
-
-    async def agentic_voice(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE
-    ) -> None:
-        """Transcribe voice message -> Claude, minimal chrome."""
-        user_id = update.effective_user.id
-
-        features = context.bot_data.get("features")
-        voice_handler = features.get_voice_handler() if features else None
-
-        if not voice_handler:
-            await update.message.reply_text(self._voice_unavailable_message())
-            return
-
-        chat = update.message.chat
-        await chat.send_action("typing")
-        progress_msg = await update.message.reply_text("Transcribing...")
-
-        try:
-            voice = update.message.voice
-            processed_voice = await voice_handler.process_voice_message(
-                voice, update.message.caption
-            )
-
-            await progress_msg.edit_text("Working...")
-            await self._handle_agentic_media_message(
-                update=update,
-                context=context,
-                prompt=processed_voice.prompt,
-                progress_msg=progress_msg,
-                user_id=user_id,
-                chat=chat,
-            )
-
-        except Exception as e:
-            from .handlers.message import _format_error_message
-
-            await progress_msg.edit_text(_format_error_message(e), parse_mode="HTML")
-            logger.error(
-                "Claude voice processing failed", error=str(e), user_id=user_id
             )
 
     async def _handle_agentic_media_message(
@@ -1847,6 +2042,38 @@ class MessageOrchestrator:
             await active.progress_msg.edit_text("Stopping...", reply_markup=None)
         except Exception:
             pass
+
+    async def _handle_plan_callback(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle plan: callbacks — delegate to PlanningHandler."""
+        await PlanningHandler.handle_plan_callback(
+            update, context, self._resume_after_planning
+        )
+
+    async def _handle_ask_callback(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle ask: callbacks — delegate to PlanningHandler."""
+        await PlanningHandler.handle_ask_callback(
+            update, context, self._resume_after_planning
+        )
+
+    async def _resume_after_planning(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        state: PlanningState,
+        prompt: str,
+    ) -> None:
+        """Resume a Claude session after a planning interaction completes."""
+        if state.session_id:
+            context.user_data["claude_session_id"] = state.session_id
+        if state.working_directory:
+            context.user_data["current_directory"] = Path(state.working_directory)
+        await self._process_text_with_claude(
+            update, context, prompt, audit_command="planning_response"
+        )
 
     async def _agentic_callback(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
