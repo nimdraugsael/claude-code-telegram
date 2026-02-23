@@ -115,6 +115,7 @@ class ClaudeResponse:
     is_error: bool = False
     error_type: Optional[str] = None
     tools_used: List[Dict[str, Any]] = field(default_factory=list)
+    interrupted: bool = False
 
 
 @dataclass
@@ -156,6 +157,7 @@ class ClaudeSDKManager:
         session_id: Optional[str] = None,
         continue_session: bool = False,
         stream_callback: Optional[Callable[[StreamUpdate], None]] = None,
+        interrupt_event: Optional[asyncio.Event] = None,
     ) -> ClaudeResponse:
         """Execute Claude Code command via SDK."""
         start_time = asyncio.get_event_loop().time()
@@ -205,45 +207,62 @@ class ClaudeSDKManager:
 
             # Collect messages via ClaudeSDKClient
             messages: List[Message] = []
+            interrupted = False
 
             async def _run_client() -> None:
                 async with ClaudeSDKClient(options) as client:
-                    await client.query(prompt)
+                    # Spawn interrupt watcher if an event was provided
+                    interrupt_task: Optional[asyncio.Task[None]] = None
+                    if interrupt_event is not None:
 
-                    # Iterate over raw messages and parse them ourselves
-                    # so that MessageParseError (e.g. from rate_limit_event)
-                    # doesn't kill the underlying async generator. When
-                    # parse_message raises inside the SDK's receive_messages()
-                    # generator, Python terminates that generator permanently,
-                    # causing us to lose all subsequent messages including
-                    # the ResultMessage.
-                    async for raw_data in client._query.receive_messages():
-                        try:
-                            message = parse_message(raw_data)
-                        except MessageParseError as e:
-                            logger.debug(
-                                "Skipping unparseable message",
-                                error=str(e),
-                            )
-                            continue
+                        async def _watch_interrupt() -> None:
+                            nonlocal interrupted
+                            await interrupt_event.wait()
+                            await client.interrupt()
+                            interrupted = True
 
-                        messages.append(message)
+                        interrupt_task = asyncio.create_task(_watch_interrupt())
 
-                        if isinstance(message, ResultMessage):
-                            break
+                    try:
+                        await client.query(prompt)
 
-                        # Handle streaming callback
-                        if stream_callback:
+                        # Iterate over raw messages and parse them ourselves
+                        # so that MessageParseError (e.g. from rate_limit_event)
+                        # doesn't kill the underlying async generator. When
+                        # parse_message raises inside the SDK's
+                        # receive_messages() generator, Python terminates that
+                        # generator permanently, causing us to lose all
+                        # subsequent messages including the ResultMessage.
+                        async for raw_data in client._query.receive_messages():
                             try:
-                                await self._handle_stream_message(
-                                    message, stream_callback
+                                message = parse_message(raw_data)
+                            except MessageParseError as e:
+                                logger.debug(
+                                    "Skipping unparseable message",
+                                    error=str(e),
                                 )
-                            except Exception as callback_error:
-                                logger.warning(
-                                    "Stream callback failed",
-                                    error=str(callback_error),
-                                    error_type=type(callback_error).__name__,
-                                )
+                                continue
+
+                            messages.append(message)
+
+                            if isinstance(message, ResultMessage):
+                                break
+
+                            # Handle streaming callback
+                            if stream_callback:
+                                try:
+                                    await self._handle_stream_message(
+                                        message, stream_callback
+                                    )
+                                except Exception as callback_error:
+                                    logger.warning(
+                                        "Stream callback failed",
+                                        error=str(callback_error),
+                                        error_type=type(callback_error).__name__,
+                                    )
+                    finally:
+                        if interrupt_task is not None:
+                            interrupt_task.cancel()
 
             # Execute with timeout
             await asyncio.wait_for(
@@ -310,6 +329,7 @@ class ClaudeSDKManager:
                     ]
                 ),
                 tools_used=tools_used,
+                interrupted=interrupted,
             )
 
         except asyncio.TimeoutError:

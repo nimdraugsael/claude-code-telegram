@@ -150,8 +150,8 @@ def test_agentic_registers_text_document_photo_handlers(agentic_settings, deps):
 
     # 4 message handlers (text, document, photo, voice)
     assert len(msg_handlers) == 4
-    # 1 callback handler (for cd: only)
-    assert len(cb_handlers) == 1
+    # 2 callback handlers (stop: and cd:)
+    assert len(cb_handlers) == 2
 
 
 async def test_agentic_bot_commands(agentic_settings, deps):
@@ -310,10 +310,16 @@ async def test_agentic_callback_scoped_to_cd_pattern(agentic_settings, deps):
         if isinstance(call[0][0], CallbackQueryHandler)
     ]
 
-    assert len(cb_handlers) == 1
-    # The pattern attribute should match cd: prefixed data
-    assert cb_handlers[0].pattern is not None
-    assert cb_handlers[0].pattern.match("cd:my_project")
+    assert len(cb_handlers) == 2
+    # One handler should match stop: and the other cd:
+    cd_handlers = [
+        h for h in cb_handlers if h.pattern and h.pattern.match("cd:my_project")
+    ]
+    stop_handlers = [
+        h for h in cb_handlers if h.pattern and h.pattern.match("stop:123")
+    ]
+    assert len(cd_handlers) == 1
+    assert len(stop_handlers) == 1
 
 
 async def test_agentic_document_rejects_large_files(agentic_settings, deps):
@@ -881,25 +887,17 @@ class TestAgenticVoice:
             voice_handler=voice_handler,
         )
 
-        # Progress message mock for _process_text_with_claude
-        progress_msg = AsyncMock()
-        progress_msg.delete = AsyncMock()
-        # reply_text returns progress_msg on second call (first is transcription reply)
-        update.message.reply_text.side_effect = [
-            None,  # transcription reply
-            progress_msg,  # "Working..." progress
-            None,  # final response
-        ]
-        update.message.reply_text.return_value = progress_msg
+        # All reply_text calls return the same mock (works as both
+        # transcribing_msg and progress_msg).
+        msg_mock = AsyncMock()
+        msg_mock.delete = AsyncMock()
+        update.message.reply_text.return_value = msg_mock
 
         await orchestrator.agentic_voice(update, context)
 
-        # Transcription was shown to user
-        reply_calls = update.message.reply_text.call_args_list
-        transcription_shown = any(
-            "Please review my code" in str(call) for call in reply_calls
-        )
-        assert transcription_shown
+        # Transcription was shown via edit_text on the message mock
+        edit_calls = [c.args[0] for c in msg_mock.edit_text.call_args_list if c.args]
+        assert any("Please review my code" in t for t in edit_calls)
 
         # Claude was called with the transcribed text
         claude_integration.run_command.assert_called_once()
@@ -924,7 +922,9 @@ class TestAgenticVoice:
 
         await orchestrator.agentic_voice(update, context)
 
-        msg = update.message.reply_text.call_args.args[0]
+        # Error delivered via edit_text on the "Transcribing..." message
+        transcribing_msg = update.message.reply_text.return_value
+        msg = transcribing_msg.edit_text.call_args.args[0]
         assert "too large" in msg.lower()
         assert "25MB" in msg
 
@@ -944,7 +944,9 @@ class TestAgenticVoice:
 
         await orchestrator.agentic_voice(update, context)
 
-        msg = update.message.reply_text.call_args.args[0]
+        # Error delivered via edit_text on the "Transcribing..." message
+        transcribing_msg = update.message.reply_text.return_value
+        msg = transcribing_msg.edit_text.call_args.args[0]
         assert "failed to transcribe" in msg.lower()
 
     async def test_empty_transcription_prompts_typing(self, agentic_settings, deps):
@@ -969,7 +971,9 @@ class TestAgenticVoice:
 
         await orchestrator.agentic_voice(update, context)
 
-        msg = update.message.reply_text.call_args.args[0]
+        # Error delivered via edit_text on the "Transcribing..." message
+        transcribing_msg = update.message.reply_text.return_value
+        msg = transcribing_msg.edit_text.call_args.args[0]
         assert "could not transcribe" in msg.lower()
         assert "typing" in msg.lower()
 
