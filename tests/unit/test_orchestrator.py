@@ -150,8 +150,8 @@ def test_agentic_registers_text_document_photo_handlers(agentic_settings, deps):
 
     # 4 message handlers (text, document, photo, voice)
     assert len(msg_handlers) == 4
-    # 2 callback handlers (stop: and cd:)
-    assert len(cb_handlers) == 2
+    # 4 callback handlers (stop:, plan:, ask:, cd:)
+    assert len(cb_handlers) == 4
 
 
 async def test_agentic_bot_commands(agentic_settings, deps):
@@ -257,6 +257,7 @@ async def test_agentic_text_calls_claude(agentic_settings, deps):
     update.message.message_id = 1
     update.message.chat.send_action = AsyncMock()
     update.message.reply_text = AsyncMock()
+    update.effective_message = update.message
 
     # Progress message mock
     progress_msg = AsyncMock()
@@ -310,16 +311,24 @@ async def test_agentic_callback_scoped_to_cd_pattern(agentic_settings, deps):
         if isinstance(call[0][0], CallbackQueryHandler)
     ]
 
-    assert len(cb_handlers) == 2
-    # One handler should match stop: and the other cd:
+    assert len(cb_handlers) == 4
+    # Handlers should match stop:, plan:, ask:, and cd: patterns
     cd_handlers = [
         h for h in cb_handlers if h.pattern and h.pattern.match("cd:my_project")
     ]
     stop_handlers = [
         h for h in cb_handlers if h.pattern and h.pattern.match("stop:123")
     ]
+    plan_handlers = [
+        h for h in cb_handlers if h.pattern and h.pattern.match("plan:123:approve")
+    ]
+    ask_handlers = [
+        h for h in cb_handlers if h.pattern and h.pattern.match("ask:123:0:1")
+    ]
     assert len(cd_handlers) == 1
     assert len(stop_handlers) == 1
+    assert len(plan_handlers) == 1
+    assert len(ask_handlers) == 1
 
 
 async def test_agentic_document_rejects_large_files(agentic_settings, deps):
@@ -334,6 +343,7 @@ async def test_agentic_document_rejects_large_files(agentic_settings, deps):
 
     context = MagicMock()
     context.bot_data = {"security_validator": None}
+    context.user_data = {}  # no planning_state
 
     await orchestrator.agentic_document(update, context)
 
@@ -378,6 +388,7 @@ async def test_agentic_text_logs_failure_on_error(agentic_settings, deps):
     update.message.message_id = 1
     update.message.chat.send_action = AsyncMock()
     update.message.reply_text = AsyncMock()
+    update.effective_message = update.message
 
     progress_msg = AsyncMock()
     progress_msg.delete = AsyncMock()
@@ -802,6 +813,7 @@ class TestAgenticVoice:
         update.message.message_id = 42
         update.message.reply_text = AsyncMock()
         update.message.chat.send_action = AsyncMock()
+        update.effective_message = update.message
         return update
 
     @staticmethod

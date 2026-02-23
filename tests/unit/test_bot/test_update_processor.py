@@ -32,32 +32,42 @@ def _make_update(callback_data: str | None = None) -> Update:
 
 
 # ---------------------------------------------------------------------------
-# _is_stop_callback
+# _is_priority_callback
 # ---------------------------------------------------------------------------
 
 
-class TestIsStopCallback:
+class TestIsPriorityCallback:
     def test_stop_callback_detected(self):
         update = _make_update("stop:123")
-        assert StopAwareUpdateProcessor._is_stop_callback(update) is True
+        assert StopAwareUpdateProcessor._is_priority_callback(update) is True
 
-    def test_cd_callback_not_stop(self):
+    def test_plan_callback_detected(self):
+        update = _make_update("plan:123:approve")
+        assert StopAwareUpdateProcessor._is_priority_callback(update) is True
+
+    def test_ask_callback_detected(self):
+        update = _make_update("ask:123:0:1")
+        assert StopAwareUpdateProcessor._is_priority_callback(update) is True
+
+    def test_cd_callback_not_priority(self):
         update = _make_update("cd:my_project")
-        assert StopAwareUpdateProcessor._is_stop_callback(update) is False
+        assert StopAwareUpdateProcessor._is_priority_callback(update) is False
 
     def test_no_callback_query(self):
         update = _make_update(None)
-        assert StopAwareUpdateProcessor._is_stop_callback(update) is False
+        assert StopAwareUpdateProcessor._is_priority_callback(update) is False
 
     def test_non_update_object(self):
-        assert StopAwareUpdateProcessor._is_stop_callback("not an update") is False
+        assert (
+            StopAwareUpdateProcessor._is_priority_callback("not an update") is False
+        )
 
     def test_callback_with_none_data(self):
         update = MagicMock(spec=Update)
         cb = MagicMock(spec=CallbackQuery)
         cb.data = None
         update.callback_query = cb
-        assert StopAwareUpdateProcessor._is_stop_callback(update) is False
+        assert StopAwareUpdateProcessor._is_priority_callback(update) is False
 
 
 # ---------------------------------------------------------------------------

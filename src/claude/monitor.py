@@ -22,6 +22,12 @@ from ..security.validators import SecurityValidator
 # outside the project's approved directory.
 _CLAUDE_INTERNAL_SUBDIRS: Set[str] = {"plans", "todos", "settings.json"}
 
+# Planning tools are handled by the bot itself (intercepted in the stream
+# callback) and should always be allowed through the tool monitor.
+_PLANNING_TOOLS: frozenset = frozenset(
+    {"EnterPlanMode", "ExitPlanMode", "AskUserQuestion"}
+)
+
 logger = structlog.get_logger()
 
 # Commands that modify the filesystem and should have paths checked
@@ -196,6 +202,13 @@ class ToolMonitor:
             working_directory=str(working_directory),
             user_id=user_id,
         )
+
+        # Planning tools are intercepted by the bot's stream callback and
+        # never actually execute filesystem/shell operations, so they can
+        # always pass through regardless of allow/disallow lists.
+        if tool_name in _PLANNING_TOOLS:
+            self.tool_usage[tool_name] += 1
+            return True, None
 
         # When disabled, skip only allowlist/disallowlist name checks.
         # Keep path and command safety validation active.

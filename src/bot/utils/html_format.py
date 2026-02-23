@@ -8,6 +8,27 @@ Claude's output which contains underscores, asterisks, brackets, etc.
 import re
 from typing import List, Tuple
 
+_LOCAL_FILE_RE = re.compile(r"!?\[([^\]]*)\]\((/[^)]+)\)")
+
+
+def extract_local_file_refs(text: str) -> Tuple[str, List[Tuple[str, str]]]:
+    """Extract [alt](/local/path) and ![alt](/local/path) references from markdown.
+
+    Returns (cleaned_text, [(alt, path), ...]).
+    Only absolute paths (starting with ``/``) are extracted; HTTP URLs
+    are left untouched.  Matched references are removed from the text so
+    they don't become broken ``<a>`` tags after HTML conversion.
+    """
+    refs: List[Tuple[str, str]] = []
+
+    def _replace(m: re.Match) -> str:  # type: ignore[type-arg]
+        alt, path = m.group(1), m.group(2)
+        refs.append((alt, path))
+        return ""
+
+    cleaned = _LOCAL_FILE_RE.sub(_replace, text)
+    return cleaned, refs
+
 
 def escape_html(text: str) -> str:
     """Escape the 3 HTML-special characters for Telegram.

@@ -11,7 +11,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import structlog
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -28,7 +28,14 @@ from ..claude.exceptions import ClaudeToolValidationError
 from ..claude.sdk_integration import StreamUpdate
 from ..config.settings import Settings
 from ..projects import PrivateTopicsUnavailableError
-from .utils.html_format import escape_html
+from .planning import (
+    PlanningHandler,
+    PlanningState,
+    _load_state,
+    _save_state,
+    detect_planning_tool,
+)
+from .utils.html_format import escape_html, extract_local_file_refs
 
 logger = structlog.get_logger()
 
@@ -554,6 +561,20 @@ class MessageOrchestrator:
             )
         )
 
+        # Planning callbacks
+        app.add_handler(
+            CallbackQueryHandler(
+                self._inject_deps(self._handle_plan_callback),
+                pattern=r"^plan:",
+            )
+        )
+        app.add_handler(
+            CallbackQueryHandler(
+                self._inject_deps(self._handle_ask_callback),
+                pattern=r"^ask:",
+            )
+        )
+
         # Only cd: callbacks (for project selection), scoped by pattern
         app.add_handler(
             CallbackQueryHandler(
@@ -883,20 +904,41 @@ class MessageOrchestrator:
         tool_log: List[Dict[str, Any]],
         start_time: float,
         reply_markup: Optional[InlineKeyboardMarkup] = None,
+        planning_state_ref: Optional[List[Optional[Dict[str, Any]]]] = None,
+        interrupt_event: Optional[asyncio.Event] = None,
     ) -> Optional[Callable[[StreamUpdate], Any]]:
         """Create a stream callback for verbose progress updates.
 
-        Returns None when verbose_level is 0 (nothing to display).
-        Typing indicators are handled by a separate heartbeat task.
+        When *planning_state_ref* and *interrupt_event* are provided the
+        callback also watches for planning tool calls (``ExitPlanMode``,
+        ``AskUserQuestion``).  When one is detected the callback stores
+        tool information in ``planning_state_ref[0]`` and fires the
+        interrupt so the SDK stops.
+
+        Returns a callback even when verbose_level is 0 if planning
+        detection is enabled, because we still need to watch the stream.
         """
-        if verbose_level == 0:
+        needs_planning = planning_state_ref is not None and interrupt_event is not None
+        if verbose_level == 0 and not needs_planning:
             return None
 
         last_edit_time = [0.0]  # mutable container for closure
 
         async def _on_stream(update_obj: StreamUpdate) -> None:
+            # --- Planning tool detection ---
+            if needs_planning and update_obj.tool_calls:
+                ptool = detect_planning_tool(update_obj.tool_calls)
+                if ptool is not None:
+                    # Store tool info for the caller
+                    planning_state_ref[0] = {  # type: ignore[index]
+                        "tool_name": ptool["name"],
+                        "tool_input": ptool.get("input", {}),
+                    }
+                    interrupt_event.set()  # type: ignore[union-attr]
+                    return  # skip normal logging for this event
+
             # Capture tool calls
-            if update_obj.tool_calls:
+            if update_obj.tool_calls and verbose_level >= 1:
                 for tc in update_obj.tool_calls:
                     name = tc.get("name", "unknown")
                     detail = self._summarize_tool_input(name, tc.get("input", {}))
@@ -912,16 +954,19 @@ class MessageOrchestrator:
                         tool_log.append({"kind": "text", "detail": first_line[:120]})
 
             # Throttle progress message edits to avoid Telegram rate limits
-            now = time.time()
-            if (now - last_edit_time[0]) >= 2.0 and tool_log:
-                last_edit_time[0] = now
-                new_text = self._format_verbose_progress(
-                    tool_log, verbose_level, start_time
-                )
-                try:
-                    await progress_msg.edit_text(new_text, reply_markup=reply_markup)
-                except Exception:
-                    pass
+            if verbose_level >= 1:
+                now = time.time()
+                if (now - last_edit_time[0]) >= 2.0 and tool_log:
+                    last_edit_time[0] = now
+                    new_text = self._format_verbose_progress(
+                        tool_log, verbose_level, start_time
+                    )
+                    try:
+                        await progress_msg.edit_text(
+                            new_text, reply_markup=reply_markup
+                        )
+                    except Exception:
+                        pass
 
         return _on_stream
 
@@ -941,15 +986,19 @@ class MessageOrchestrator:
         """
         user_id = update.effective_user.id
 
+        message = update.effective_message
+        if not message:
+            return
+
         # Rate limit check
         rate_limiter = context.bot_data.get("rate_limiter")
         if rate_limiter:
             allowed, limit_message = await rate_limiter.check_rate_limit(user_id, 0.001)
             if not allowed:
-                await update.message.reply_text(f"\u23f1\ufe0f {limit_message}")
+                await message.reply_text(f"\u23f1\ufe0f {limit_message}")
                 return
 
-        chat = update.message.chat
+        chat = message.chat
         await chat.send_action("typing")
 
         verbose_level = self._get_verbose_level(context)
@@ -959,7 +1008,7 @@ class MessageOrchestrator:
         stop_kb = InlineKeyboardMarkup(
             [[InlineKeyboardButton("Stop", callback_data=f"stop:{user_id}")]]
         )
-        progress_msg = await update.message.reply_text(
+        progress_msg = await message.reply_text(
             self._random_working_text(), reply_markup=stop_kb
         )
 
@@ -990,18 +1039,22 @@ class MessageOrchestrator:
 
         tool_log: List[Dict[str, Any]] = []
         start_time = time.time()
+        planning_state_ref: List[Optional[Dict[str, Any]]] = [None]
         on_stream = self._make_stream_callback(
             verbose_level,
             progress_msg,
             tool_log,
             start_time,
             reply_markup=stop_kb,
+            planning_state_ref=planning_state_ref,
+            interrupt_event=interrupt_event,
         )
 
         heartbeat = self._start_typing_heartbeat(chat)
 
         success = True
         formatted_messages: list = []  # type: ignore[type-arg]
+        local_files: List[Tuple[str, str]] = []
         try:
             claude_response = await claude_integration.run_command(
                 prompt=text,
@@ -1024,6 +1077,54 @@ class MessageOrchestrator:
                 claude_response, context, self.settings, user_id
             )
 
+            # --- Planning tool detected: hand off to PlanningHandler ---
+            if planning_state_ref[0] is not None:
+                heartbeat.cancel()
+                self._active_requests.pop(user_id, None)
+                try:
+                    await progress_msg.delete()
+                except Exception:
+                    pass
+
+                ptool = planning_state_ref[0]
+                tool_name = ptool["tool_name"]
+                tool_input = ptool.get("tool_input", {})
+
+                if tool_name == "ExitPlanMode":
+                    state = PlanningState(
+                        type="plan_approval",
+                        session_id=claude_response.session_id,
+                        working_directory=str(current_dir),
+                        chat_id=chat.id,
+                    )
+                    _save_state(context, state)
+                    await PlanningHandler.present_plan(
+                        update, context, state,
+                        plan_content=claude_response.content or "",
+                    )
+                elif tool_name == "AskUserQuestion":
+                    questions = tool_input.get("questions", [])
+                    state = PlanningState(
+                        type="user_question",
+                        session_id=claude_response.session_id,
+                        working_directory=str(current_dir),
+                        chat_id=chat.id,
+                        questions=questions,
+                        answers={},
+                        current_question_idx=0,
+                    )
+                    _save_state(context, state)
+                    await PlanningHandler.present_question(update, context, state)
+
+                if audit_logger:
+                    await audit_logger.log_command(
+                        user_id=user_id,
+                        command=audit_command,
+                        args=[text[:100]],
+                        success=True,
+                    )
+                return
+
             if storage:
                 try:
                     await storage.save_claude_interaction(
@@ -1041,10 +1142,16 @@ class MessageOrchestrator:
             formatter = ResponseFormatter(self.settings)
 
             response_content = claude_response.content
-            if claude_response.interrupted:
+            if claude_response.interrupted and planning_state_ref[0] is None:
                 response_content = (
                     response_content or ""
                 ) + "\n\n_(Interrupted by user)_"
+
+            # Extract local file references before formatting
+            if response_content:
+                response_content, local_files = extract_local_file_refs(
+                    response_content
+                )
 
             formatted_messages = formatter.format_claude_response(response_content)
 
@@ -1073,13 +1180,13 @@ class MessageOrchestrator:
         except Exception:
             pass
 
-        for i, message in enumerate(formatted_messages):
-            if not message.text or not message.text.strip():
+        for i, fmt_msg in enumerate(formatted_messages):
+            if not fmt_msg.text or not fmt_msg.text.strip():
                 continue
             try:
-                await update.message.reply_text(
-                    message.text,
-                    parse_mode=message.parse_mode,
+                await message.reply_text(
+                    fmt_msg.text,
+                    parse_mode=fmt_msg.parse_mode,
                     reply_markup=None,
                 )
                 if i < len(formatted_messages) - 1:
@@ -1091,15 +1198,28 @@ class MessageOrchestrator:
                     message_index=i,
                 )
                 try:
-                    await update.message.reply_text(
-                        message.text,
+                    await message.reply_text(
+                        fmt_msg.text,
                         reply_markup=None,
                     )
                 except Exception as plain_err:
-                    await update.message.reply_text(
+                    await message.reply_text(
                         f"Failed to deliver response "
                         f"(Telegram error: {str(plain_err)[:150]}). "
                         f"Please try again.",
+                    )
+
+        # Send extracted local files as document attachments
+        for alt, fpath in local_files:
+            p = Path(fpath)
+            if p.is_file():
+                try:
+                    await message.reply_document(
+                        document=p, caption=alt or p.name
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to send local file", path=fpath, error=str(exc)
                     )
 
         if audit_logger:
@@ -1114,6 +1234,15 @@ class MessageOrchestrator:
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         """Direct Claude passthrough. Simple progress. No suggestions."""
+        # Check for pending planning interaction first
+        state = _load_state(context)
+        if state is not None:
+            handled = await PlanningHandler.handle_text_for_planning(
+                update, context, state, self._resume_after_planning
+            )
+            if handled:
+                return
+
         user_id = update.effective_user.id
         message_text = update.message.text
 
@@ -1129,6 +1258,12 @@ class MessageOrchestrator:
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         """Transcribe voice message via Whisper, then process with Claude."""
+        if _load_state(context) is not None:
+            await update.message.reply_text(
+                "Please respond to the pending question first."
+            )
+            return
+
         user_id = update.effective_user.id
         voice = update.message.voice
 
@@ -1207,6 +1342,12 @@ class MessageOrchestrator:
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         """Process file upload -> Claude, minimal chrome."""
+        if _load_state(context) is not None:
+            await update.message.reply_text(
+                "Please respond to the pending question first."
+            )
+            return
+
         user_id = update.effective_user.id
         document = update.message.document
 
@@ -1274,6 +1415,12 @@ class MessageOrchestrator:
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         """Process photo -> Claude, minimal chrome."""
+        if _load_state(context) is not None:
+            await update.message.reply_text(
+                "Please respond to the pending question first."
+            )
+            return
+
         user_id = update.effective_user.id
 
         features = context.bot_data.get("features")
@@ -1432,6 +1579,38 @@ class MessageOrchestrator:
             await active.progress_msg.edit_text("Stopping...", reply_markup=None)
         except Exception:
             pass
+
+    async def _handle_plan_callback(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle plan: callbacks — delegate to PlanningHandler."""
+        await PlanningHandler.handle_plan_callback(
+            update, context, self._resume_after_planning
+        )
+
+    async def _handle_ask_callback(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle ask: callbacks — delegate to PlanningHandler."""
+        await PlanningHandler.handle_ask_callback(
+            update, context, self._resume_after_planning
+        )
+
+    async def _resume_after_planning(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        state: PlanningState,
+        prompt: str,
+    ) -> None:
+        """Resume a Claude session after a planning interaction completes."""
+        if state.session_id:
+            context.user_data["claude_session_id"] = state.session_id
+        if state.working_directory:
+            context.user_data["current_directory"] = Path(state.working_directory)
+        await self._process_text_with_claude(
+            update, context, prompt, audit_command="planning_response"
+        )
 
     async def _agentic_callback(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE

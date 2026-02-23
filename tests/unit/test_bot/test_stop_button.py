@@ -194,6 +194,7 @@ class TestStopButtonOnProgress:
         progress_msg = AsyncMock()
         progress_msg.delete = AsyncMock()
         update.message.reply_text = AsyncMock(return_value=progress_msg)
+        update.effective_message = update.message
 
         context = MagicMock()
         context.user_data = {"current_directory": settings.approved_directory}
@@ -258,6 +259,7 @@ class TestStopButtonOnProgress:
         progress_msg = AsyncMock()
         progress_msg.delete = AsyncMock()
         update.message.reply_text = AsyncMock(return_value=progress_msg)
+        update.effective_message = update.message
 
         context = MagicMock()
         context.user_data = {"current_directory": settings.approved_directory}
@@ -304,6 +306,7 @@ class TestStopButtonOnProgress:
         progress_msg = AsyncMock()
         progress_msg.delete = AsyncMock()
         update.message.reply_text = AsyncMock(return_value=progress_msg)
+        update.effective_message = update.message
 
         context = MagicMock()
         context.user_data = {"current_directory": settings.approved_directory}
