@@ -200,6 +200,10 @@ class Settings(BaseSettings):
         True,
         description="Conversational agentic mode (default) vs classic command mode",
     )
+    funny_progress_words: bool = Field(
+        False,
+        description="Use whimsical spinner words instead of 'Working...' for progress",
+    )
 
     # Reply quoting
     reply_quote: bool = Field(
