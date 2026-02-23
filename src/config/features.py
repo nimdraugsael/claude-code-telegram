@@ -72,6 +72,11 @@ class FeatureFlags:
         return self.settings.agentic_mode
 
     @property
+    def funny_progress_words_enabled(self) -> bool:
+        """Check if whimsical spinner words are enabled."""
+        return self.settings.funny_progress_words
+
+    @property
     def voice_messages_enabled(self) -> bool:
         """Check if voice message transcription is enabled."""
         return (
@@ -94,6 +99,7 @@ class FeatureFlags:
             "scheduler": self.scheduler_enabled,
             "agentic_mode": self.agentic_mode_enabled,
             "voice_messages": self.voice_messages_enabled,
+            "funny_progress_words": self.funny_progress_words_enabled,
         }
         return feature_map.get(feature_name, False)
 

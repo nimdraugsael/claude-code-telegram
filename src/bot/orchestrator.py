@@ -6,6 +6,7 @@ classic mode, delegates to existing full-featured handlers.
 """
 
 import asyncio
+import random
 import re
 import time
 from dataclasses import dataclass, field
@@ -99,6 +100,206 @@ def _tool_icon(name: str) -> str:
     return _TOOL_ICONS.get(name, "\U0001f527")
 
 
+# Whimsical spinner words (inspired by Claude Code's progress messages)
+_SPINNER_WORDS: List[str] = [
+    "Pondering",
+    "Thinking",
+    "Musing",
+    "Cogitating",
+    "Ruminating",
+    "Deliberating",
+    "Contemplating",
+    "Reflecting",
+    "Meditating",
+    "Brainstorming",
+    "Noodling",
+    "Percolating",
+    "Marinating",
+    "Simmering",
+    "Brewing",
+    "Stewing",
+    "Baking",
+    "Cooking",
+    "Crafting",
+    "Forging",
+    "Sculpting",
+    "Weaving",
+    "Knitting",
+    "Stitching",
+    "Assembling",
+    "Constructing",
+    "Building",
+    "Engineering",
+    "Architecting",
+    "Designing",
+    "Sketching",
+    "Drafting",
+    "Composing",
+    "Orchestrating",
+    "Harmonizing",
+    "Synthesizing",
+    "Distilling",
+    "Refining",
+    "Polishing",
+    "Buffing",
+    "Calibrating",
+    "Tuning",
+    "Optimizing",
+    "Streamlining",
+    "Untangling",
+    "Deciphering",
+    "Decoding",
+    "Parsing",
+    "Analyzing",
+    "Investigating",
+    "Researching",
+    "Exploring",
+    "Surveying",
+    "Scouting",
+    "Reconnoitering",
+    "Spelunking",
+    "Excavating",
+    "Unearthing",
+    "Mining",
+    "Prospecting",
+    "Panning",
+    "Sifting",
+    "Sorting",
+    "Organizing",
+    "Cataloging",
+    "Indexing",
+    "Filing",
+    "Compiling",
+    "Aggregating",
+    "Consolidating",
+    "Crunching",
+    "Computing",
+    "Calculating",
+    "Tabulating",
+    "Enumerating",
+    "Quantifying",
+    "Measuring",
+    "Gauging",
+    "Assessing",
+    "Evaluating",
+    "Appraising",
+    "Reviewing",
+    "Inspecting",
+    "Examining",
+    "Scrutinizing",
+    "Dissecting",
+    "Deconstructing",
+    "Reverse-engineering",
+    "Bootstrapping",
+    "Initializing",
+    "Configuring",
+    "Provisioning",
+    "Deploying",
+    "Launching",
+    "Igniting",
+    "Activating",
+    "Energizing",
+    "Charging",
+    "Powering up",
+    "Booting",
+    "Loading",
+    "Buffering",
+    "Rendering",
+    "Processing",
+    "Transforming",
+    "Converting",
+    "Translating",
+    "Interpreting",
+    "Transcribing",
+    "Encoding",
+    "Encrypting",
+    "Hashing",
+    "Compressing",
+    "Packaging",
+    "Bundling",
+    "Wrapping",
+    "Boxing",
+    "Crating",
+    "Shipping",
+    "Delivering",
+    "Dispatching",
+    "Channeling",
+    "Funneling",
+    "Piping",
+    "Routing",
+    "Navigating",
+    "Charting",
+    "Mapping",
+    "Plotting",
+    "Graphing",
+    "Diagramming",
+    "Modeling",
+    "Simulating",
+    "Emulating",
+    "Mimicking",
+    "Replicating",
+    "Cloning",
+    "Spawning",
+    "Generating",
+    "Producing",
+    "Manufacturing",
+    "Fabricating",
+    "Conjuring",
+    "Summoning",
+    "Invoking",
+    "Channeling",
+    "Manifesting",
+    "Materializing",
+    "Crystallizing",
+    "Solidifying",
+    "Coalescing",
+    "Converging",
+    "Merging",
+    "Fusing",
+    "Melding",
+    "Blending",
+    "Mixing",
+    "Stirring",
+    "Whisking",
+    "Folding",
+    "Kneading",
+    "Rolling",
+    "Flattening",
+    "Smoothing",
+    "Ironing",
+    "Pressing",
+    "Squeezing",
+    "Juicing",
+    "Extracting",
+    "Filtering",
+    "Straining",
+    "Purifying",
+    "Cleansing",
+    "Scrubbing",
+    "Sweeping",
+    "Tidying",
+    "Decluttering",
+    "Rearranging",
+    "Reshuffling",
+    "Juggling",
+    "Balancing",
+    "Aligning",
+    "Centering",
+    "Focusing",
+    "Concentrating",
+    "Homing in",
+    "Zeroing in",
+    "Locking on",
+    "Targeting",
+    "Aiming",
+    "Combobulating",
+    "Recombobulating",
+    "Discombobulating",
+    "Wrangling",
+    "Herding",
+]
+
+
 @dataclass
 class ActiveRequest:
     """Tracks an in-flight Claude request so it can be interrupted."""
@@ -116,6 +317,12 @@ class MessageOrchestrator:
         self.settings = settings
         self.deps = deps
         self._active_requests: Dict[int, ActiveRequest] = {}
+
+    def _random_working_text(self) -> str:
+        """Return a progress label — whimsical word or plain 'Working...'."""
+        if self.settings.funny_progress_words:
+            return f"{random.choice(_SPINNER_WORDS)}..."
+        return "Working..."
 
     def _inject_deps(self, handler: Callable) -> Callable:  # type: ignore[type-arg]
         """Wrap handler to inject dependencies into context.bot_data."""
@@ -586,10 +793,10 @@ class MessageOrchestrator:
     ) -> str:
         """Build the progress message text based on activity so far."""
         if not activity_log:
-            return "Working..."
+            return self._random_working_text()
 
         elapsed = time.time() - start_time
-        lines: List[str] = [f"Working... ({elapsed:.0f}s)\n"]
+        lines: List[str] = [f"{self._random_working_text()} ({elapsed:.0f}s)\n"]
 
         for entry in activity_log[-15:]:  # Show last 15 entries max
             kind = entry.get("kind", "tool")
@@ -753,7 +960,7 @@ class MessageOrchestrator:
             [[InlineKeyboardButton("Stop", callback_data=f"stop:{user_id}")]]
         )
         progress_msg = await update.message.reply_text(
-            "Working...", reply_markup=stop_kb
+            self._random_working_text(), reply_markup=stop_kb
         )
 
         # Register active request for stop callback

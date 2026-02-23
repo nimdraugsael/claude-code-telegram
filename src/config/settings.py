@@ -177,6 +177,10 @@ class Settings(BaseSettings):
         True,
         description="Conversational agentic mode (default) vs classic command mode",
     )
+    funny_progress_words: bool = Field(
+        False,
+        description="Use whimsical spinner words instead of 'Working...' for progress",
+    )
 
     # Output verbosity (0=quiet, 1=normal, 2=detailed)
     verbose_level: int = Field(
