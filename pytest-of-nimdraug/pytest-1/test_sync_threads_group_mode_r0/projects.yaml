@@ -1,0 +1,4 @@
+projects:
+  - slug: project_a
+    name: Project A
+    path: project_a

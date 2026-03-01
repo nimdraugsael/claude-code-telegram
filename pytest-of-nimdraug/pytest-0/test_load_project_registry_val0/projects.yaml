@@ -1,0 +1,8 @@
+projects:
+  - slug: app1
+    name: App One
+    path: app_one
+  - slug: app2
+    name: App Two
+    path: app_two
+    enabled: false

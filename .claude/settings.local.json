@@ -1,0 +1,28 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find:*)",
+      "Bash(head:*)",
+      "Bash(python3:*)",
+      "Bash(poetry run:*)",
+      "Bash(uv run:*)",
+      "Bash(grep:*)",
+      "WebSearch",
+      "WebFetch(domain:core.telegram.org)",
+      "Bash(tail:*)",
+      "Bash(git stash:*)",
+      "Bash(git:*)",
+      "Bash(/Users/nimdraug/Work/stuff/claude-code-telegram/.venv/bin/python3:*)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:blog.alexbeals.com)",
+      "WebFetch(domain:x.com)",
+      "WebFetch(domain:lust.dev)",
+      "WebFetch(domain:gist.github.com)",
+      "WebFetch(domain:sixeleven.in)",
+      "WebFetch(domain:aiengineerguide.com)",
+      "WebFetch(domain:danielmiessler.com)",
+      "Bash(make lint:*)",
+      "Bash(gh repo:*)"
+    ]
+  }
+}
