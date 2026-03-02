@@ -150,8 +150,8 @@ def test_agentic_registers_text_document_photo_handlers(agentic_settings, deps):
 
     # 3 message handlers (text, document, photo)
     assert len(msg_handlers) == 3
-    # 2 callback handlers (stop: and cd:)
-    assert len(cb_handlers) == 2
+    # 4 callback handlers (stop:, plan:, ask:, cd:)
+    assert len(cb_handlers) == 4
 
 
 async def test_agentic_bot_commands(agentic_settings, deps):
@@ -247,6 +247,7 @@ async def test_agentic_text_calls_claude(agentic_settings, deps):
     mock_response.session_id = "session-abc"
     mock_response.content = "Hello, I can help with that!"
     mock_response.tools_used = []
+    mock_response.interrupted = False
 
     claude_integration = AsyncMock()
     claude_integration.run_command = AsyncMock(return_value=mock_response)
@@ -310,16 +311,24 @@ async def test_agentic_callback_scoped_to_cd_pattern(agentic_settings, deps):
         if isinstance(call[0][0], CallbackQueryHandler)
     ]
 
-    assert len(cb_handlers) == 2
-    # One handler should match stop: and the other cd:
+    assert len(cb_handlers) == 4
+    # Handlers match stop:, plan:, ask:, cd:
     cd_handlers = [
         h for h in cb_handlers if h.pattern and h.pattern.match("cd:my_project")
     ]
     stop_handlers = [
         h for h in cb_handlers if h.pattern and h.pattern.match("stop:123")
     ]
+    plan_handlers = [
+        h for h in cb_handlers if h.pattern and h.pattern.match("plan:123:approve")
+    ]
+    ask_handlers = [
+        h for h in cb_handlers if h.pattern and h.pattern.match("ask:123:0:1")
+    ]
     assert len(cd_handlers) == 1
     assert len(stop_handlers) == 1
+    assert len(plan_handlers) == 1
+    assert len(ask_handlers) == 1
 
 
 async def test_agentic_document_rejects_large_files(agentic_settings, deps):
@@ -333,6 +342,7 @@ async def test_agentic_document_rejects_large_files(agentic_settings, deps):
     update.message.reply_text = AsyncMock()
 
     context = MagicMock()
+    context.user_data = {}
     context.bot_data = {"security_validator": None}
 
     await orchestrator.agentic_document(update, context)

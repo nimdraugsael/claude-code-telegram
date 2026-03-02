@@ -1,9 +1,9 @@
 """Tests for StopAwareUpdateProcessor.
 
 Covers:
-- Stop callbacks bypass the sequential lock (run immediately)
+- Priority callbacks (stop:*, plan:*, ask:*) bypass the sequential lock
 - Regular updates are serialized (only one at a time)
-- Non-stop callbacks (e.g. cd:) go through the sequential lock
+- Non-priority callbacks (e.g. cd:) go through the sequential lock
 """
 
 import asyncio
@@ -32,32 +32,40 @@ def _make_update(callback_data: str | None = None) -> Update:
 
 
 # ---------------------------------------------------------------------------
-# _is_stop_callback
+# _is_priority_callback
 # ---------------------------------------------------------------------------
 
 
-class TestIsStopCallback:
+class TestIsPriorityCallback:
     def test_stop_callback_detected(self):
         update = _make_update("stop:123")
-        assert StopAwareUpdateProcessor._is_stop_callback(update) is True
+        assert StopAwareUpdateProcessor._is_priority_callback(update) is True
 
-    def test_cd_callback_not_stop(self):
+    def test_plan_callback_detected(self):
+        update = _make_update("plan:123:approve")
+        assert StopAwareUpdateProcessor._is_priority_callback(update) is True
+
+    def test_ask_callback_detected(self):
+        update = _make_update("ask:123:0:1")
+        assert StopAwareUpdateProcessor._is_priority_callback(update) is True
+
+    def test_cd_callback_not_priority(self):
         update = _make_update("cd:my_project")
-        assert StopAwareUpdateProcessor._is_stop_callback(update) is False
+        assert StopAwareUpdateProcessor._is_priority_callback(update) is False
 
     def test_no_callback_query(self):
         update = _make_update(None)
-        assert StopAwareUpdateProcessor._is_stop_callback(update) is False
+        assert StopAwareUpdateProcessor._is_priority_callback(update) is False
 
     def test_non_update_object(self):
-        assert StopAwareUpdateProcessor._is_stop_callback("not an update") is False
+        assert StopAwareUpdateProcessor._is_priority_callback("not an update") is False
 
     def test_callback_with_none_data(self):
         update = MagicMock(spec=Update)
         cb = MagicMock(spec=CallbackQuery)
         cb.data = None
         update.callback_query = cb
-        assert StopAwareUpdateProcessor._is_stop_callback(update) is False
+        assert StopAwareUpdateProcessor._is_priority_callback(update) is False
 
 
 # ---------------------------------------------------------------------------
@@ -65,7 +73,7 @@ class TestIsStopCallback:
 # ---------------------------------------------------------------------------
 
 
-class TestStopCallbackBypassesLock:
+class TestPriorityCallbackBypassesLock:
     async def test_stop_callback_runs_while_lock_held(self):
         """A stop callback runs immediately even when sequential lock is held."""
         processor = StopAwareUpdateProcessor()
@@ -112,6 +120,46 @@ class TestStopCallbackBypassesLock:
             "regular_end",
         ]
 
+    async def test_plan_callback_runs_while_lock_held(self):
+        """A plan callback runs immediately even when sequential lock is held."""
+        processor = StopAwareUpdateProcessor()
+
+        execution_order: list[str] = []
+        lock_acquired = asyncio.Event()
+        plan_done = asyncio.Event()
+
+        async def slow_coroutine():
+            execution_order.append("regular_start")
+            lock_acquired.set()
+            await plan_done.wait()
+            execution_order.append("regular_end")
+
+        async def plan_coroutine():
+            execution_order.append("plan_start")
+            execution_order.append("plan_end")
+            plan_done.set()
+
+        regular_update = _make_update(None)
+        plan_update = _make_update("plan:42:approve")
+
+        regular_task = asyncio.create_task(
+            processor.do_process_update(regular_update, slow_coroutine())
+        )
+        await lock_acquired.wait()
+
+        plan_task = asyncio.create_task(
+            processor.do_process_update(plan_update, plan_coroutine())
+        )
+
+        await asyncio.gather(regular_task, plan_task)
+
+        assert execution_order == [
+            "regular_start",
+            "plan_start",
+            "plan_end",
+            "regular_end",
+        ]
+
 
 class TestRegularUpdatesSequential:
     async def test_two_regular_updates_do_not_overlap(self):
@@ -149,9 +197,9 @@ class TestRegularUpdatesSequential:
         assert execution_log == ["a_start", "a_end", "b_start", "b_end"]
 
 
-class TestNonStopCallbackSequential:
+class TestNonPriorityCallbackSequential:
     async def test_cd_callback_goes_through_sequential_lock(self):
-        """Non-stop callbacks (cd:*) are treated as regular updates."""
+        """Non-priority callbacks (cd:*) are treated as regular updates."""
         processor = StopAwareUpdateProcessor()
 
         execution_log: list[str] = []
