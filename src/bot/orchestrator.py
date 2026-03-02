@@ -32,6 +32,13 @@ from telegram.ext import (
 from ..claude.sdk_integration import StreamUpdate
 from ..config.settings import Settings
 from ..projects import PrivateTopicsUnavailableError
+from .planning import (
+    PlanningHandler,
+    PlanningState,
+    _load_state,
+    _save_state,
+    detect_planning_tool,
+)
 from .utils.html_format import escape_html
 from .utils.image_extractor import (
     ImageAttachment,
@@ -353,6 +360,20 @@ class MessageOrchestrator:
             CallbackQueryHandler(
                 self._inject_deps(self._handle_stop_callback),
                 pattern=r"^stop:",
+            )
+        )
+
+        # Planning callbacks
+        app.add_handler(
+            CallbackQueryHandler(
+                self._inject_deps(self._handle_plan_callback),
+                pattern=r"^plan:",
+            )
+        )
+        app.add_handler(
+            CallbackQueryHandler(
+                self._inject_deps(self._handle_ask_callback),
+                pattern=r"^ask:",
             )
         )
 
@@ -683,6 +704,8 @@ class MessageOrchestrator:
         mcp_images: Optional[List[ImageAttachment]] = None,
         approved_directory: Optional[Path] = None,
         reply_markup: Optional[InlineKeyboardMarkup] = None,
+        planning_state_ref: Optional[List[Optional[Dict[str, Any]]]] = None,
+        interrupt_event: Optional[asyncio.Event] = None,
     ) -> Optional[Callable[[StreamUpdate], Any]]:
         """Create a stream callback for verbose progress updates.
 
@@ -690,18 +713,36 @@ class MessageOrchestrator:
         ``send_image_to_user`` tool calls and collects validated
         :class:`ImageAttachment` objects for later Telegram delivery.
 
-        Returns None when verbose_level is 0 **and** no MCP image
-        collection is requested.
+        When *planning_state_ref* and *interrupt_event* are provided the
+        callback also watches for planning tool calls (``ExitPlanMode``,
+        ``AskUserQuestion``).  When one is detected the callback stores
+        tool information in ``planning_state_ref[0]`` and fires the
+        interrupt so the SDK stops.
+
+        Returns None when verbose_level is 0 **and** no interception is
+        requested.
         Typing indicators are handled by a separate heartbeat task.
         """
         need_mcp_intercept = mcp_images is not None and approved_directory is not None
+        needs_planning = planning_state_ref is not None and interrupt_event is not None
 
-        if verbose_level == 0 and not need_mcp_intercept:
+        if verbose_level == 0 and not need_mcp_intercept and not needs_planning:
             return None
 
         last_edit_time = [0.0]  # mutable container for closure
 
         async def _on_stream(update_obj: StreamUpdate) -> None:
+            # --- Planning tool detection ---
+            if needs_planning and update_obj.tool_calls:
+                ptool = detect_planning_tool(update_obj.tool_calls)
+                if ptool is not None:
+                    planning_state_ref[0] = {  # type: ignore[index]
+                        "tool_name": ptool["name"],
+                        "tool_input": ptool.get("input", {}),
+                    }
+                    interrupt_event.set()  # type: ignore[union-attr]
+                    return  # skip normal logging for this event
+
             # Intercept send_image_to_user MCP tool calls.
             # The SDK namespaces MCP tools as "mcp__<server>__<tool>",
             # so match both the bare name and the namespaced variant.
@@ -846,6 +887,15 @@ class MessageOrchestrator:
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         """Direct Claude passthrough. Delegates to shared processing method."""
+        # Check for pending planning interaction first
+        state = _load_state(context)
+        if state is not None:
+            handled = await PlanningHandler.handle_text_for_planning(
+                update, context, state, self._resume_after_planning
+            )
+            if handled:
+                return
+
         user_id = update.effective_user.id
         message_text = update.message.text
 
@@ -923,6 +973,7 @@ class MessageOrchestrator:
         tool_log: List[Dict[str, Any]] = []
         start_time = time.time()
         mcp_images: List[ImageAttachment] = []
+        planning_state_ref: List[Optional[Dict[str, Any]]] = [None]
         on_stream = self._make_stream_callback(
             verbose_level,
             progress_msg,
@@ -931,6 +982,8 @@ class MessageOrchestrator:
             mcp_images=mcp_images,
             approved_directory=self.settings.approved_directory,
             reply_markup=stop_kb,
+            planning_state_ref=planning_state_ref,
+            interrupt_event=interrupt_event,
         )
 
         heartbeat = self._start_typing_heartbeat(chat)
@@ -959,6 +1012,56 @@ class MessageOrchestrator:
                 claude_response, context, self.settings, user_id
             )
 
+            # --- Planning tool detected: hand off to PlanningHandler ---
+            if planning_state_ref[0] is not None:
+                heartbeat.cancel()
+                self._active_requests.pop(user_id, None)
+                try:
+                    await progress_msg.delete()
+                except Exception:
+                    pass
+
+                ptool = planning_state_ref[0]
+                tool_name = ptool["tool_name"]
+                tool_input = ptool.get("tool_input", {})
+
+                if tool_name == "ExitPlanMode":
+                    state = PlanningState(
+                        type="plan_approval",
+                        session_id=claude_response.session_id,
+                        working_directory=str(current_dir),
+                        chat_id=chat.id,
+                    )
+                    _save_state(context, state)
+                    await PlanningHandler.present_plan(
+                        update,
+                        context,
+                        state,
+                        plan_content=claude_response.content or "",
+                    )
+                elif tool_name == "AskUserQuestion":
+                    questions = tool_input.get("questions", [])
+                    state = PlanningState(
+                        type="user_question",
+                        session_id=claude_response.session_id,
+                        working_directory=str(current_dir),
+                        chat_id=chat.id,
+                        questions=questions,
+                        answers={},
+                        current_question_idx=0,
+                    )
+                    _save_state(context, state)
+                    await PlanningHandler.present_question(update, context, state)
+
+                if audit_logger:
+                    await audit_logger.log_command(
+                        user_id=user_id,
+                        command=audit_command,
+                        args=[text[:100]],
+                        success=True,
+                    )
+                return
+
             if storage:
                 try:
                     await storage.save_claude_interaction(
@@ -976,7 +1079,7 @@ class MessageOrchestrator:
             formatter = ResponseFormatter(self.settings)
 
             response_content = claude_response.content
-            if claude_response.interrupted:
+            if claude_response.interrupted and planning_state_ref[0] is None:
                 response_content = (
                     response_content or ""
                 ) + "\n\n_(Interrupted by user)_"
@@ -1074,6 +1177,12 @@ class MessageOrchestrator:
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         """Process file upload -> Claude, minimal chrome."""
+        if _load_state(context) is not None:
+            await update.message.reply_text(
+                "Please respond to the pending question first."
+            )
+            return
+
         user_id = update.effective_user.id
         document = update.message.document
 
@@ -1141,6 +1250,12 @@ class MessageOrchestrator:
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         """Process photo -> Claude, minimal chrome."""
+        if _load_state(context) is not None:
+            await update.message.reply_text(
+                "Please respond to the pending question first."
+            )
+            return
+
         user_id = update.effective_user.id
 
         features = context.bot_data.get("features")
@@ -1301,6 +1416,38 @@ class MessageOrchestrator:
             await active.progress_msg.edit_text("Stopping...", reply_markup=None)
         except Exception:
             pass
+
+    async def _handle_plan_callback(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle plan: callbacks — delegate to PlanningHandler."""
+        await PlanningHandler.handle_plan_callback(
+            update, context, self._resume_after_planning
+        )
+
+    async def _handle_ask_callback(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle ask: callbacks — delegate to PlanningHandler."""
+        await PlanningHandler.handle_ask_callback(
+            update, context, self._resume_after_planning
+        )
+
+    async def _resume_after_planning(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        state: PlanningState,
+        prompt: str,
+    ) -> None:
+        """Resume a Claude session after a planning interaction completes."""
+        if state.session_id:
+            context.user_data["claude_session_id"] = state.session_id
+        if state.working_directory:
+            context.user_data["current_directory"] = Path(state.working_directory)
+        await self._process_text_with_claude(
+            update, context, prompt, audit_command="planning_response"
+        )
 
     async def _agentic_callback(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
